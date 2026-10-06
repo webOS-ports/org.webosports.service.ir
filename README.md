@@ -1,5 +1,12 @@
-# org.webosports.service.ir
+org.webosports.service.ir
+=========================
 
+Summary
+-------
+LuneOS service for the infrared transmitter (IR blaster): carrier plus mark/space timings.
+
+Description
+-----------
 LuneOS service for the infrared transmitter (IR blaster). `irblasterd` puts it
 on the bus with the same model as Android's ConsumerIrManager: a carrier
 frequency plus alternating mark/space durations in microseconds. Protocol
@@ -11,7 +18,8 @@ Backends, picked at start-up:
   Galaxy Tab Pro 10.1 (SM-T520) and other Exynos 5420 tablets
 - `lirc` - mainline `/dev/lirc0` (gpio-ir-tx, ir-spi, pwm-ir-tx, USB)
 
-## API
+API
+---
 
 `luna://org.webosports.service.ir/getStatus` (subscribable)
 
@@ -36,7 +44,8 @@ burst at most 5 seconds and, on sec_ir, at most a page of text.
 
 Both methods are in the `ir.operation` group.
 
-## Checks
+Checks
+------
 
 - `tests/static-analysis.sh`: gcc -fanalyzer (-O0 and -O2), the clang static
   analyzer with its alpha unix/security checkers, clang-tidy, cppcheck,
