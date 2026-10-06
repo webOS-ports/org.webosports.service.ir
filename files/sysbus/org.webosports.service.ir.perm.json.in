@@ -1,0 +1,5 @@
+{
+    "org.webosports.service.ir": [
+        "servicebus.signal"
+    ]
+}

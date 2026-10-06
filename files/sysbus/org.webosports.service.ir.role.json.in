@@ -1,0 +1,13 @@
+{
+    "exeName": "@WEBOS_INSTALL_SBINDIR@/irblasterd",
+    "trustLevel": "oem",
+    "type": "regular",
+    "allowedNames": ["org.webosports.service.ir", ""],
+    "permissions": [
+        {
+            "service": "org.webosports.service.ir",
+            "inbound": ["*"],
+            "outbound": ["*"]
+        }
+    ]
+}

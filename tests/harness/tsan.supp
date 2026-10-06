@@ -1,0 +1,11 @@
+# ThreadSanitizer suppressions for the irblasterd harness.
+#
+# glib's GAsyncQueue keeps its entries in GList nodes it allocates when a job
+# is pushed (main thread) and frees with g_slice_free1 when the job is popped
+# (worker), under a futex lock TSan cannot see. The node is glib's own and
+# irblasterd never calls g_slice_*, so this matches nothing of ours. Our own
+# hand-overs are annotated in test.c instead of suppressed.
+race:g_slice_free1
+# The same node freed on the GQueue path - also hit with no job ever pushed,
+# by the stop message g_thread_pool_free() queues for its own worker.
+race:g_queue_pop_tail

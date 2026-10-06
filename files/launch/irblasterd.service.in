@@ -1,0 +1,19 @@
+[Unit]
+Description=LuneOS infrared transmitter service
+
+# The registration made with the hub cannot outlive it, so irblasterd has to be
+# restarted whenever the hub is: PartOf covers a deliberate restart of ls-hubd,
+# the disconnect handler in main.c covers the hub crashing.
+After=ls-hubd.service
+PartOf=ls-hubd.service
+
+[Service]
+Type=simple
+ExecStart=@WEBOS_INSTALL_SBINDIR@/irblasterd
+Restart=always
+# Without a delay this spins while the hub is gone, and systemd's start limit
+# then gives up on the service for good.
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+{
+    "allowedNames": ["org.webosports.service.ir"],
+    "ir.operation": ["dev"]
+}

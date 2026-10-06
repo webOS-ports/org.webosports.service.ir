@@ -1,0 +1,6 @@
+{
+    "ir.operation": [
+        "org.webosports.service.ir/getStatus",
+        "org.webosports.service.ir/transmit"
+    ]
+}
