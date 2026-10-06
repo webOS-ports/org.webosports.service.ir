@@ -102,6 +102,16 @@
 #define SYSFS_WRITE_LIMIT  4096
 
 /*
+ * The duty cycle lirc transmitters are asked for: a third, what Flipper uses
+ * for every protocol and what IR receivers are built around. Set on every
+ * send, not left to the driver's default, because a driver may not have one:
+ * MediaTek's mtk_irtx_pwm (the Zinwa Q25) allocates its state uninitialised
+ * and only fills in its cycle when a duty cycle under 40% is set, so without
+ * this it sizes its DMA buffer from garbage and fails with ENOMEM.
+ */
+#define LIRC_DUTY_CYCLE    33
+
+/*
  * Requests waiting behind the one on the LED. A held key sends one at a time
  * and waits for the reply, so this only ever fills up when something floods
  * the service - and then each queued pattern is 4 KB we would hold forever.
@@ -134,6 +144,8 @@ static int exit_status = 0;
 static gint stopping = 0;
 /* Written once in main() before the worker exists, read-only after that */
 static Backend backend = BACKEND_NONE;
+/* LIRC_GET_FEATURES of /dev/lirc0, likewise set once before the worker starts */
+static unsigned int lirc_features = 0;
 
 static const char *backend_name(Backend b)
 {
@@ -185,6 +197,7 @@ static Backend probe_backend(void)
 	can_send = ioctl(fd, LIRC_GET_FEATURES, &features) == 0 &&
 	           (features & LIRC_CAN_SEND_PULSE) != 0;
 	close(fd);
+	lirc_features = features;
 
 	return can_send ? BACKEND_LIRC : BACKEND_NONE;
 }
@@ -276,6 +289,7 @@ static char *transmit_sec_ir(guint frequency, const guint *pattern, guint count,
 static char *transmit_lirc(guint frequency, const guint *pattern, guint count)
 {
 	unsigned int carrier = frequency;
+	unsigned int duty = LIRC_DUTY_CYCLE;
 	ssize_t written;
 	size_t length;
 	int fd;
@@ -288,9 +302,17 @@ static char *transmit_lirc(guint frequency, const guint *pattern, guint count)
 	}
 
 	/* Not every LIRC transmitter can change its carrier; that is not fatal */
-	if (ioctl(fd, LIRC_SET_SEND_CARRIER, &carrier) < 0)
+	if ((lirc_features & LIRC_CAN_SET_SEND_CARRIER) &&
+	        ioctl(fd, LIRC_SET_SEND_CARRIER, &carrier) < 0)
 	{
 		g_warning("%s: cannot set a %u Hz carrier: %s", LIRC_DEVICE, frequency,
+		          g_strerror(errno));
+	}
+
+	if ((lirc_features & LIRC_CAN_SET_SEND_DUTY_CYCLE) &&
+	        ioctl(fd, LIRC_SET_SEND_DUTY_CYCLE, &duty) < 0)
+	{
+		g_warning("%s: cannot set a %u%% duty cycle: %s", LIRC_DEVICE, duty,
 		          g_strerror(errno));
 	}
 

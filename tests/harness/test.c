@@ -199,6 +199,9 @@ ssize_t harness_write(int fd, const void *buf, size_t count)
 	}
 }
 
+/* What the lirc mode's transmitter was last asked for */
+static gint lirc_carrier = 0, lirc_duty = 0;
+
 int harness_ioctl(int fd, unsigned long request, ...)
 {
 	va_list ap;
@@ -210,12 +213,21 @@ int harness_ioctl(int fd, unsigned long request, ...)
 
 	if (request == LIRC_GET_FEATURES)
 	{
-		*arg = LIRC_CAN_SEND_PULSE | LIRC_CAN_SET_SEND_CARRIER;
+		*arg = LIRC_CAN_SEND_PULSE | LIRC_CAN_SET_SEND_CARRIER | LIRC_CAN_SET_SEND_DUTY_CYCLE;
 		return 0;
 	}
 
 	if (request == LIRC_SET_SEND_CARRIER)
+	{
+		g_atomic_int_set(&lirc_carrier, (gint)*arg);
 		return 0;
+	}
+
+	if (request == LIRC_SET_SEND_DUTY_CYCLE)
+	{
+		g_atomic_int_set(&lirc_duty, (gint)*arg);
+		return 0;
+	}
 
 	errno = ENOTTY;
 	return -1;
@@ -616,6 +628,9 @@ static void lirc_checked(const char *request, const char *reply, gpointer user_d
 	CHECK(captured->len == 3 * sizeof(unsigned int), "lirc: wrote %u bytes, want 3 ints (even count trimmed)", captured->len);
 	pthread_mutex_unlock(&capture_lock);
 	CHECK(data && ((unsigned int *)data)[0] == 9000 && ((unsigned int *)data)[2] == 560, "lirc: wrong durations");
+	/* Both set before the write; a driver may have no defaults (mtk_irtx_pwm) */
+	CHECK(g_atomic_int_get(&lirc_carrier) == 38000, "lirc: carrier %d, want 38000", g_atomic_int_get(&lirc_carrier));
+	CHECK(g_atomic_int_get(&lirc_duty) == 33, "lirc: duty cycle %d, want 33", g_atomic_int_get(&lirc_duty));
 	g_free(data);
 	shim_disconnect();
 }
