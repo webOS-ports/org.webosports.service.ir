@@ -25,18 +25,24 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${1:-${TMPDIR:-/tmp}/irblasterd-harness}
 mkdir -p "$WORK"
 GLIB=$(pkg-config --cflags --libs glib-2.0)
-# Quoted twice: build() goes through eval, which takes one level off
-PATHS="-DSEC_IR_SEND='\"$WORK/ir_send\"' -DSEC_IR_RESULT='\"$WORK/ir_send_result\"' -DLIRC_DEVICE='\"$WORK/lirc0\"'"
+# Quoted twice: build() goes through eval, which takes one level off. The
+# Android IR HAL backend dlopens the stand-in libgbinder from the work
+# directory, built per sanitizer next to its test.
+PATHS="-DSEC_IR_SEND='\"$WORK/ir_send\"' -DSEC_IR_RESULT='\"$WORK/ir_send_result\"' -DLIRC_DEVICE='\"$WORK/lirc0\"' -DIR_HAL_PROBE_INTERVAL_MS=20"
 SRC_DEFINE=${IR_SRC:+-DIR_MAIN_C='\"$IR_SRC\"'}
 COMMON="$SRC_DEFINE -g -O1 -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-parameter -Werror -I$HERE/include -I$HERE"
-MODES="sec_ir lirc none sigterm late-reply"
+MODES="sec_ir lirc none sigterm late-reply hal hal-late"
 fail=0
 
 build() {
 	name=$1; cc=$2; shift 2
 	echo "== build $name"
+	mkdir -p "$WORK/$name"
 	# shellcheck disable=SC2086
-	eval $cc $COMMON $PATHS "$@" "$HERE/test.c" "$HERE/shim.c" -o "$WORK/test-$name" $GLIB || { fail=1; return 1; }
+	eval $cc $COMMON -fPIC -shared "$@" "$HERE/fakegbinder.c" -o "$WORK/$name/libgbinder.so.1" $GLIB || { fail=1; return 1; }
+	# shellcheck disable=SC2086
+	eval $cc $COMMON $PATHS "-DIR_GBINDER_LIB='\"$WORK/$name/libgbinder.so.1\"'" "$@" "$HERE/test.c" "$HERE/shim.c" \
+		"$WORK/$name/libgbinder.so.1" -Wl,-rpath,"$WORK/$name" -ldl -o "$WORK/test-$name" $GLIB || { fail=1; return 1; }
 }
 
 run() {

@@ -17,6 +17,11 @@ Backends, picked at start-up:
 - `sec_ir` - Samsung's iCE40 FPGA driver (`/sys/class/sec/sec_ir`), e.g. the
   Galaxy Tab Pro 10.1 (SM-T520) and other Exynos 5420 tablets
 - `lirc` - mainline `/dev/lirc0` (gpio-ir-tx, ir-spi, pwm-ir-tx, USB)
+- `android_ir` - on Halium, the Android IR HAL (`android.hardware.ir@1.0`
+  `IConsumerIr`) over hwbinder, for transmitters only a vendor library can
+  drive, e.g. the Xiaomi Mi A1's Peel chip. libgbinder is opened at runtime,
+  so the package stays generic; a HAL that comes up after the service is
+  picked up within two minutes and `getStatus` subscribers are told.
 
 API
 ---

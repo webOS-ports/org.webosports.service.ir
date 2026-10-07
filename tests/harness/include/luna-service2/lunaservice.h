@@ -31,6 +31,7 @@ bool LSUnregister(LSHandle *sh, LSError *error);
 bool LSMessageReply(LSHandle *sh, LSMessage *msg, const char *payload, LSError *error);
 const char *LSMessageGetPayload(LSMessage *msg);
 bool LSMessageIsSubscription(LSMessage *msg);
+bool LSSubscriptionReply(LSHandle *sh, const char *key, const char *payload, LSError *error);
 bool LSSubscriptionProcess(LSHandle *sh, LSMessage *msg, bool *subscribed, LSError *error);
 void LSMessageRef(LSMessage *msg);
 void LSMessageUnref(LSMessage *msg);

@@ -18,3 +18,6 @@ void shim_disconnect(void);
 int shim_live_values(void);
 int shim_live_messages(void);
 int shim_bad_replies(void);
+/* Statuses pushed to subscribers so far, "key payload" per line (g_free it) */
+char *shim_posts(void);
+void shim_free_posts(void);

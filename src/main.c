@@ -32,8 +32,14 @@
  *  - lirc: the mainline /dev/lirc0 interface (gpio-ir-tx, ir-spi, pwm-ir-tx,
  *    USB transceivers) - carrier set by ioctl, then the durations written as
  *    an array of unsigned ints.
+ *  - android_ir: on Halium, the Android IR HAL (android.hardware.ir@1.0
+ *    IConsumerIr) over hwbinder, for transmitters only a vendor library knows
+ *    how to drive - the Mi A1's Peel chip on /dev/peel_ir takes a raw SPI
+ *    bitstream. Its transmit() takes exactly this service's carrier and
+ *    pattern, so nothing needs translating.
  */
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glib.h>
@@ -60,6 +66,30 @@
 #ifndef LIRC_DEVICE
 #define LIRC_DEVICE   "/dev/lirc0"
 #endif
+#ifndef IR_GBINDER_LIB
+#define IR_GBINDER_LIB "libgbinder.so.1"
+#endif
+#ifndef HWBINDER_DEVICE
+#define HWBINDER_DEVICE "/dev/hwbinder"
+#endif
+
+#define IR_HAL_IFACE    "android.hardware.ir@1.0::IConsumerIr"
+#define IR_HAL_INSTANCE IR_HAL_IFACE "/default"
+/*
+ * HIDL numbers methods from 1 (FIRST_CALL_TRANSACTION) in declaration order,
+ * and IConsumerIr.hal declares transmit() first:
+ *   transmit(int32_t carrierFreq, vec<int32_t> pattern) generates (bool success)
+ */
+#define IR_HAL_TRANSMIT 1
+
+/*
+ * The Android container can come up after this service on a Halium device,
+ * so a HAL that is not there at start is looked for again for a while.
+ */
+#ifndef IR_HAL_PROBE_INTERVAL_MS
+#define IR_HAL_PROBE_INTERVAL_MS 5000
+#endif
+#define IR_HAL_PROBE_ATTEMPTS   24
 
 /*
  * OPEN_FLAGS: every node this service opens is a fixed path under /sys or /dev
@@ -123,7 +153,47 @@ typedef enum
 	BACKEND_NONE,
 	BACKEND_SEC_IR,
 	BACKEND_LIRC,
+	BACKEND_ANDROID_IR,
 } Backend;
+
+/*
+ * libgbinder, opened at runtime rather than linked. It is built per machine
+ * (its gbinder.conf names the device's binder API level), and linking it would
+ * make this service machine-specific too - but it ships in the generic Halium
+ * rootfs. Opened when present, the HAL backend simply exists where libgbinder
+ * and an IR HAL do, and nowhere else. The few calls used are declared here with
+ * the signatures of gbinder's public headers (libgbinder.so.1); the reader and
+ * writer are caller-allocated structs of that ABI's size.
+ */
+typedef struct GBinderServiceManager GBinderServiceManager;
+typedef struct GBinderRemoteObject GBinderRemoteObject;
+typedef struct GBinderClient GBinderClient;
+typedef struct GBinderLocalRequest GBinderLocalRequest;
+typedef struct GBinderRemoteReply GBinderRemoteReply;
+typedef struct { gconstpointer d[4]; } GBinderWriter;
+typedef struct { gconstpointer d[6]; } GBinderReader;
+
+typedef struct
+{
+	GBinderServiceManager *(*servicemanager_new)(const char *dev);
+	void (*servicemanager_unref)(GBinderServiceManager *sm);
+	GBinderRemoteObject *(*servicemanager_get_service_sync)(GBinderServiceManager *sm,
+	        const char *name, int *status);
+	GBinderClient *(*client_new)(GBinderRemoteObject *object, const char *iface);
+	void (*client_unref)(GBinderClient *client);
+	GBinderLocalRequest *(*client_new_request)(GBinderClient *client);
+	GBinderRemoteReply *(*client_transact_sync_reply)(GBinderClient *client, guint32 code,
+	        GBinderLocalRequest *req, int *status);
+	void (*local_request_init_writer)(GBinderLocalRequest *request, GBinderWriter *writer);
+	void (*local_request_unref)(GBinderLocalRequest *request);
+	void (*writer_append_int32)(GBinderWriter *writer, guint32 value);
+	void (*writer_append_hidl_vec)(GBinderWriter *writer, const void *base, guint count,
+	                               guint elemsize);
+	void (*remote_reply_init_reader)(GBinderRemoteReply *reply, GBinderReader *reader);
+	gboolean (*reader_read_int32)(GBinderReader *reader, gint32 *value);
+	gboolean (*reader_read_bool)(GBinderReader *reader, gboolean *value);
+	void (*remote_reply_unref)(GBinderRemoteReply *reply);
+} GBinderApi;
 
 typedef struct
 {
@@ -142,10 +212,28 @@ static GThreadPool *transmit_pool = NULL;
 static int exit_status = 0;
 /* Set by main() on the way out; queued jobs are then answered, not sent */
 static gint stopping = 0;
-/* Written once in main() before the worker exists, read-only after that */
-static Backend backend = BACKEND_NONE;
+/*
+ * A Backend. Set in main() before the worker starts, and once more by the main
+ * loop if the Android IR HAL turns up late - hence atomic.
+ */
+static gint backend = BACKEND_NONE;
 /* LIRC_GET_FEATURES of /dev/lirc0, likewise set once before the worker starts */
 static unsigned int lirc_features = 0;
+
+/* libgbinder and the HAL client; every gbinder call is made under hal_lock */
+static GMutex hal_lock;
+static GBinderApi gb;
+static bool gb_loaded = false;
+static GBinderServiceManager *hal_sm = NULL;
+static GBinderClient *hal_client = NULL;
+static guint hal_probes_left = IR_HAL_PROBE_ATTEMPTS;
+/* The main loop's re-probe timer, 0 when none is pending */
+static guint hal_reprobe_id = 0;
+
+static Backend backend_get(void)
+{
+	return (Backend)g_atomic_int_get(&backend);
+}
 
 static const char *backend_name(Backend b)
 {
@@ -157,10 +245,153 @@ static const char *backend_name(Backend b)
 	case BACKEND_LIRC:
 		return "lirc";
 
+	case BACKEND_ANDROID_IR:
+		return "android_ir";
+
 	case BACKEND_NONE:
 	default:
 		return "none";
 	}
+}
+
+/*
+ * Resolves one libgbinder symbol into a function pointer of gb; false if the
+ * library lacks it. The store through (void **) is the form POSIX gives for
+ * dlsym, since C has no conversion between object and function pointers.
+ */
+static bool gb_sym(void *lib, const char *name, void **slot)
+{
+	void *sym = dlsym(lib, name);
+
+	if (sym == NULL)
+	{
+		g_warning("%s: no %s", IR_GBINDER_LIB, name);
+		return false;
+	}
+
+	*slot = sym;
+	return true;
+}
+
+#define GB_SYM(lib, fn) gb_sym((lib), "gbinder_" #fn, (void **)&gb.fn)
+
+/*
+ * Opens libgbinder once. Never closed: it runs threads of its own, and the
+ * process ends when the service does anyway.
+ */
+static bool gb_load(void)
+{
+	void *lib;
+
+	if (gb_loaded)
+	{
+		return true;
+	}
+
+	lib = dlopen(IR_GBINDER_LIB, RTLD_NOW | RTLD_LOCAL);
+
+	if (lib == NULL)
+	{
+		return false;
+	}
+
+	if (!GB_SYM(lib, servicemanager_new) ||
+	        !GB_SYM(lib, servicemanager_unref) ||
+	        !GB_SYM(lib, servicemanager_get_service_sync) ||
+	        !GB_SYM(lib, client_new) ||
+	        !GB_SYM(lib, client_unref) ||
+	        !GB_SYM(lib, client_new_request) ||
+	        !GB_SYM(lib, client_transact_sync_reply) ||
+	        !GB_SYM(lib, local_request_init_writer) ||
+	        !GB_SYM(lib, local_request_unref) ||
+	        !GB_SYM(lib, writer_append_int32) ||
+	        !GB_SYM(lib, writer_append_hidl_vec) ||
+	        !GB_SYM(lib, remote_reply_init_reader) ||
+	        !GB_SYM(lib, reader_read_int32) ||
+	        !GB_SYM(lib, reader_read_bool) ||
+	        !GB_SYM(lib, remote_reply_unref))
+	{
+		dlclose(lib);
+		return false;
+	}
+
+	gb_loaded = true;
+	return true;
+}
+
+/*
+ * Looks the HAL up and keeps a client for it. Called with hal_lock held. The
+ * remote object get_service_sync returns is libgbinder's to release; the
+ * client holds its own reference.
+ */
+static bool hal_connect_locked(void)
+{
+	GBinderRemoteObject *remote;
+	int status = 0;
+
+	if (hal_client != NULL)
+	{
+		return true;
+	}
+
+	if (!gb_load())
+	{
+		return false;
+	}
+
+	if (hal_sm == NULL)
+	{
+		hal_sm = gb.servicemanager_new(HWBINDER_DEVICE);
+
+		if (hal_sm == NULL)
+		{
+			return false;
+		}
+	}
+
+	remote = gb.servicemanager_get_service_sync(hal_sm, IR_HAL_INSTANCE, &status);
+
+	if (remote == NULL)
+	{
+		return false;
+	}
+
+	hal_client = gb.client_new(remote, IR_HAL_IFACE);
+	return hal_client != NULL;
+}
+
+/* Drops the client, so the next call looks the HAL up again. hal_lock held. */
+static void hal_reset_locked(void)
+{
+	if (hal_client != NULL)
+	{
+		gb.client_unref(hal_client);
+		hal_client = NULL;
+	}
+}
+
+static bool hal_probe(void)
+{
+	bool found;
+
+	g_mutex_lock(&hal_lock);
+	found = hal_connect_locked();
+	g_mutex_unlock(&hal_lock);
+	return found;
+}
+
+static void hal_shutdown(void)
+{
+	g_mutex_lock(&hal_lock);
+	hal_reset_locked();
+
+	if (hal_sm != NULL)
+	{
+		gb.servicemanager_unref(hal_sm);
+		hal_sm = NULL;
+	}
+
+	g_mutex_unlock(&hal_lock);
 }
 
 /*
@@ -176,7 +407,6 @@ static const char *backend_name(Backend b)
 static Backend probe_backend(void)
 {
 	unsigned int features = 0;
-	bool can_send;
 	int fd;
 
 	fd = open(SEC_IR_SEND, O_WRONLY | O_CLOEXEC | O_NOFOLLOW); /* Flawfinder: ignore - fixed root-owned node, see OPEN_FLAGS */
@@ -189,17 +419,20 @@ static Backend probe_backend(void)
 
 	fd = open(LIRC_DEVICE, O_RDWR | O_CLOEXEC | O_NOFOLLOW); /* Flawfinder: ignore - fixed root-owned node, see OPEN_FLAGS */
 
-	if (fd < 0)
+	if (fd >= 0)
 	{
-		return BACKEND_NONE;
+		bool can_send = ioctl(fd, LIRC_GET_FEATURES, &features) == 0 &&
+		                (features & LIRC_CAN_SEND_PULSE) != 0;
+		close(fd);
+
+		if (can_send)
+		{
+			lirc_features = features;
+			return BACKEND_LIRC;
+		}
 	}
 
-	can_send = ioctl(fd, LIRC_GET_FEATURES, &features) == 0 &&
-	           (features & LIRC_CAN_SEND_PULSE) != 0;
-	close(fd);
-	lirc_features = features;
-
-	return can_send ? BACKEND_LIRC : BACKEND_NONE;
+	return hal_probe() ? BACKEND_ANDROID_IR : BACKEND_NONE;
 }
 
 static char *transmit_sec_ir(guint frequency, const guint *pattern, guint count, bool *acknowledged)
@@ -332,6 +565,104 @@ static char *transmit_lirc(guint frequency, const guint *pattern, guint count)
 	return NULL;
 }
 
+/*
+ * IConsumerIr::transmit(carrierFreq, pattern): the reply is the transaction
+ * status and then the HAL's bool. A HAL that restarted leaves a dead proxy
+ * behind, so a failed transaction is retried once against a fresh lookup.
+ */
+static char *transmit_hal(guint frequency, const guint *pattern, guint count, bool *acknowledged)
+{
+	gint32 *values = g_new(gint32, count);
+	char *error = NULL;
+	guint i;
+	int attempt;
+
+	/* The limits keep every value far below INT32_MAX */
+	for (i = 0; i < count; i++)
+	{
+		values[i] = (gint32)pattern[i];
+	}
+
+	g_mutex_lock(&hal_lock);
+
+	for (attempt = 0; attempt < 2; attempt++)
+	{
+		GBinderLocalRequest *request;
+		GBinderRemoteReply *reply;
+		GBinderWriter writer;
+		GBinderReader reader;
+		gint32 tx_status = -1;
+		gboolean success = FALSE;
+		int status = -1;
+		bool read_ok;
+
+		if (!hal_connect_locked())
+		{
+			g_free(error);
+			error = g_strdup("the Android IR HAL is not available");
+			break;
+		}
+
+		request = gb.client_new_request(hal_client);
+
+		if (request == NULL)
+		{
+			hal_reset_locked();
+			g_free(error);
+			error = g_strdup("cannot build a request for the Android IR HAL");
+			continue;
+		}
+
+		gb.local_request_init_writer(request, &writer);
+		gb.writer_append_int32(&writer, frequency);
+		/* values outlives the transaction, whether or not gbinder copies it */
+		gb.writer_append_hidl_vec(&writer, values, count, sizeof(*values));
+		reply = gb.client_transact_sync_reply(hal_client, IR_HAL_TRANSMIT, request, &status);
+		gb.local_request_unref(request);
+
+		if (reply == NULL || status != 0)
+		{
+			if (reply != NULL)
+			{
+				gb.remote_reply_unref(reply);
+			}
+
+			hal_reset_locked();
+			g_free(error);
+			error = g_strdup_printf("the Android IR HAL did not answer (status %d)", status);
+			continue;
+		}
+
+		gb.remote_reply_init_reader(reply, &reader);
+		read_ok = gb.reader_read_int32(&reader, &tx_status) &&
+		          gb.reader_read_bool(&reader, &success);
+		gb.remote_reply_unref(reply);
+		g_free(error);
+		error = NULL;
+
+		if (!read_ok)
+		{
+			error = g_strdup("the Android IR HAL sent a reply that could not be read");
+		}
+		else if (tx_status != 0)
+		{
+			error = g_strdup_printf("the Android IR HAL failed the call (status %d)", tx_status);
+		}
+		else if (!success)
+		{
+			error = g_strdup("the Android IR HAL refused the pattern");
+		}
+
+		break;
+	}
+
+	g_mutex_unlock(&hal_lock);
+	g_free(values);
+	/* The HAL's "true" is its driver's word that the burst went out */
+	*acknowledged = error == NULL;
+	return error;
+}
+
 static void reply_json(LSHandle *sh, LSMessage *message, jvalue_ref reply)
 {
 	LSError lserror;
@@ -403,9 +734,13 @@ static void transmit_worker(gpointer data, gpointer user_data)
 	{
 		job->error = g_strdup("the service is shutting down");
 	}
-	else if (backend == BACKEND_SEC_IR)
+	else if (backend_get() == BACKEND_SEC_IR)
 	{
 		job->error = transmit_sec_ir(job->frequency, job->pattern, job->count, &job->acknowledged);
+	}
+	else if (backend_get() == BACKEND_ANDROID_IR)
+	{
+		job->error = transmit_hal(job->frequency, job->pattern, job->count, &job->acknowledged);
 	}
 	else
 	{
@@ -422,10 +757,53 @@ static jvalue_ref build_status(void)
 	jvalue_ref reply = jobject_create();
 
 	jobject_put(reply, J_CSTR_TO_JVAL("returnValue"), jboolean_create(true));
-	jobject_put(reply, J_CSTR_TO_JVAL("available"), jboolean_create(backend != BACKEND_NONE));
-	jobject_put(reply, J_CSTR_TO_JVAL("backend"), jstring_create(backend_name(backend)));
+	jobject_put(reply, J_CSTR_TO_JVAL("available"), jboolean_create(backend_get() != BACKEND_NONE));
+	jobject_put(reply, J_CSTR_TO_JVAL("backend"), jstring_create(backend_name(backend_get())));
 	jobject_put(reply, J_CSTR_TO_JVAL("maxDurations"), jnumber_create_i32(MAX_DURATIONS));
 	return reply;
+}
+
+/* Tells getStatus subscribers what changed - the HAL turning up late */
+static void post_status(void)
+{
+	LSError lserror;
+	jvalue_ref status = build_status();
+
+	LSErrorInit(&lserror);
+
+	if (!LSSubscriptionReply(service_handle, "/getStatus", jvalue_tostring_simple(status), &lserror))
+	{
+		LSErrorPrint(&lserror, stderr);
+		LSErrorFree(&lserror);
+	}
+
+	j_release(&status);
+}
+
+/*
+ * No transmitter found at start, but libgbinder is here, so this is a Halium
+ * device whose Android side may not be up yet: look for the IR HAL again for
+ * a couple of minutes. Only the main loop changes the backend.
+ */
+static gboolean hal_reprobe(gpointer user_data)
+{
+	if (hal_probe())
+	{
+		g_atomic_int_set(&backend, (gint)BACKEND_ANDROID_IR);
+		g_message("infrared backend: %s (the Android IR HAL came up)",
+		          backend_name(BACKEND_ANDROID_IR));
+		post_status();
+		hal_reprobe_id = 0;
+		return G_SOURCE_REMOVE;
+	}
+
+	if (--hal_probes_left > 0)
+	{
+		return G_SOURCE_CONTINUE;
+	}
+
+	hal_reprobe_id = 0;
+	return G_SOURCE_REMOVE;
 }
 
 static bool cb_get_status(LSHandle *sh, LSMessage *message, void *ctx)
@@ -531,7 +909,7 @@ static bool cb_transmit(LSHandle *sh, LSMessage *message, void *ctx)
 	guint *durations;
 	guint count = 0;
 
-	if (backend == BACKEND_NONE)
+	if (backend_get() == BACKEND_NONE)
 	{
 		return reply_error(sh, message, "no infrared transmitter on this device");
 	}
@@ -626,8 +1004,13 @@ int main(int argc, char **argv)
 	LSErrorInit(&lserror);
 	main_loop = g_main_loop_new(NULL, FALSE);
 
-	backend = probe_backend();
-	g_message("infrared backend: %s", backend_name(backend));
+	g_atomic_int_set(&backend, (gint)probe_backend());
+	g_message("infrared backend: %s", backend_name(backend_get()));
+
+	if (backend_get() == BACKEND_NONE && gb_loaded)
+	{
+		hal_reprobe_id = g_timeout_add(IR_HAL_PROBE_INTERVAL_MS, hal_reprobe, NULL);
+	}
 
 	/* Exclusive, so the one thread exists from here on and push cannot fail */
 	transmit_pool = g_thread_pool_new_full(transmit_worker, NULL, job_free, 1, TRUE, NULL);
@@ -667,6 +1050,17 @@ int main(int argc, char **argv)
 	g_atomic_int_set(&stopping, 1);
 	g_thread_pool_free(transmit_pool, FALSE, TRUE);
 	transmit_pool = NULL;
+	/*
+	 * The worker is gone; stop the re-probe too before draining below, or a
+	 * late tick would connect a client again after it has been released.
+	 */
+	if (hal_reprobe_id != 0)
+	{
+		g_source_remove(hal_reprobe_id);
+		hal_reprobe_id = 0;
+	}
+
+	hal_shutdown();
 
 	while (g_main_context_iteration(NULL, FALSE))
 	{

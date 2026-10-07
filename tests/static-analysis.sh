@@ -52,6 +52,8 @@ run() {
 	fi
 }
 
+# The budget is raised so it finishes rather than stopping part-way through
+# a file this size (-Wanalyzer-too-complex would report the stop).
 # Twice: at -O2 inlining hides some paths from the analyzer (an fd leaked on
 # an early return goes unreported), at -O0 others. Its warnings are kept
 # wherever they point - a leak is reported at the inlined glib call it leaks
@@ -59,6 +61,7 @@ run() {
 for opt in -O0 -O2; do
 FILTER='warning:|error:' IGNORE_STATUS=0 \
 run "gcc -fanalyzer $opt" gcc -c -o /dev/null $opt -fanalyzer -Wanalyzer-too-complex \
+	--param=analyzer-bb-explosion-factor=50 --param=analyzer-max-enodes-per-program-point=64 \
 	-Wall -Wextra -Wno-unused-parameter $CFLAGS "$SRC"
 done
 

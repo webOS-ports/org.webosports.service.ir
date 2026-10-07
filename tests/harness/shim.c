@@ -572,6 +572,45 @@ bool LSSubscriptionProcess(LSHandle *sh, LSMessage *msg, bool *subscribed, LSErr
 	return true;
 }
 
+static GMutex posts_lock;
+static GString *posts = NULL;
+
+/* Every status pushed to subscribers, one per line, for the tests to read */
+bool LSSubscriptionReply(LSHandle *sh, const char *key, const char *payload, LSError *error)
+{
+	if (!g_main_context_is_owner(g_main_context_default()))
+	{
+		g_printerr("FAIL: subscription post from a thread that does not own the main context\n");
+		g_atomic_int_inc(&bad_replies);
+	}
+
+	g_mutex_lock(&posts_lock);
+	if (!posts)
+		posts = g_string_new(NULL);
+	g_string_append_printf(posts, "%s %s\n", key, payload);
+	g_mutex_unlock(&posts_lock);
+	return true;
+}
+
+char *shim_posts(void)
+{
+	char *s;
+
+	g_mutex_lock(&posts_lock);
+	s = g_strdup(posts ? posts->str : "");
+	g_mutex_unlock(&posts_lock);
+	return s;
+}
+
+void shim_free_posts(void)
+{
+	g_mutex_lock(&posts_lock);
+	if (posts)
+		g_string_free(posts, TRUE);
+	posts = NULL;
+	g_mutex_unlock(&posts_lock);
+}
+
 void LSMessageRef(LSMessage *msg)
 {
 	g_atomic_int_inc(&msg->refs);

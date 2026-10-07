@@ -7,7 +7,7 @@
  * JSON library, with its device nodes pointed at files in a work directory
  * and write()/ioctl() routed through hooks that can fail on demand.
  *
- * Usage: irblasterd-test <sec_ir|lirc|none|sigterm|late-reply>
+ * Usage: irblasterd-test <sec_ir|lirc|none|sigterm|late-reply|hal|hal-late>
  *
  * Built once per sanitizer by run.sh; any sanitizer report, assertion or
  * failed check exits non-zero.
@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "shim.h"
+#include "fakegbinder.h"
 
 /*
  * main.c's own main() becomes irblasterd_main(), and its write() and ioctl()
@@ -716,6 +717,161 @@ static char *open_files(void)
 }
 
 /*
+ * hal: no sec_ir or lirc node, an Android IR HAL behind the stand-in
+ * libgbinder. One step at a time, each sent when the last was answered.
+ */
+typedef struct
+{
+	const char *name;
+	void (*setup)(void);
+	const char *payload;
+	bool ok;
+	const char *error;
+} HalStep;
+
+static void hal_none(void) { }
+static void hal_fail_once(void) { fake_gbinder_fail_next(1); }
+static void hal_fail_twice(void) { fake_gbinder_fail_next(2); }
+static void hal_says_no(void) { fake_gbinder_set_reply(0, 0); }
+static void hal_bad_status(void) { fake_gbinder_set_reply(1, -1); }
+static void hal_gone(void) { fake_gbinder_set_reply(1, 0); fake_gbinder_set_present(0); fake_gbinder_fail_next(1); }
+static void hal_back(void) { fake_gbinder_set_present(1); }
+
+#define HAL_PATTERN "[9000,4500,560,560,560,1690,560]"
+
+static const HalStep hal_steps[] = {
+	{ "status", hal_none, NULL, true, "\"backend\":\"android_ir\"" },
+	{ "send", hal_none, "{\"frequency\":38000,\"pattern\":" HAL_PATTERN "}", true, "\"acknowledged\":true" },
+	{ "dead-proxy", hal_fail_once, "{\"frequency\":36000,\"pattern\":[889,889,1778]}", true, NULL },
+	{ "dead-twice", hal_fail_twice, "{\"frequency\":38000,\"pattern\":[560]}", false, "did not answer" },
+	{ "refused", hal_says_no, "{\"frequency\":38000,\"pattern\":[560]}", false, "refused" },
+	{ "bad-status", hal_bad_status, "{\"frequency\":38000,\"pattern\":[560]}", false, "failed the call" },
+	{ "gone", hal_gone, "{\"frequency\":38000,\"pattern\":[560]}", false, "not available" },
+	{ "back", hal_back, "{\"frequency\":40000,\"pattern\":[2400,600]}", true, NULL },
+};
+static guint hal_step = 0;
+static int hal_transacts_before = 0;
+
+static void hal_run_step(void);
+
+static void hal_reply(const char *request, const char *reply, gpointer user_data)
+{
+	const HalStep *st = &hal_steps[hal_step];
+	bool ok = strstr(reply, "\"returnValue\":true") != NULL;
+
+	CHECK(ok == st->ok, "hal %s: %s", st->name, reply);
+
+	if (st->error)
+		CHECK(strstr(reply, st->error) != NULL, "hal %s: want '%s' in %s", st->name, st->error, reply);
+
+	if (strcmp(st->name, "send") == 0)
+	{
+		static const gint32 want[] = { 9000, 4500, 560, 560, 560, 1690, 560 };
+		gint32 got[16];
+		guint32 carrier = 0;
+		int n = fake_gbinder_last(&carrier, got, G_N_ELEMENTS(got));
+
+		CHECK(carrier == 38000, "hal send: carrier %u", carrier);
+		CHECK(n == (int)G_N_ELEMENTS(want) && memcmp(got, want, sizeof(want)) == 0,
+		      "hal send: pattern of %d reached the HAL", n);
+	}
+
+	if (strcmp(st->name, "dead-proxy") == 0)
+	{
+		guint32 carrier = 0;
+		gint32 got[4];
+
+		CHECK(fake_gbinder_transacts() - hal_transacts_before == 2,
+		      "hal dead-proxy: %d calls, want the failed one and its retry",
+		      fake_gbinder_transacts() - hal_transacts_before);
+		fake_gbinder_last(&carrier, got, G_N_ELEMENTS(got));
+		CHECK(carrier == 36000, "hal dead-proxy: the retry carried %u", carrier);
+	}
+
+	hal_step++;
+
+	if (hal_step < G_N_ELEMENTS(hal_steps))
+		hal_run_step();
+	else
+		shim_disconnect();
+}
+
+static void hal_run_step(void)
+{
+	const HalStep *st = &hal_steps[hal_step];
+
+	st->setup();
+	hal_transacts_before = fake_gbinder_transacts();
+
+	if (st->payload)
+		shim_call("transmit", st->payload, hal_reply, NULL);
+	else
+		shim_call("getStatus", "{}", hal_reply, NULL);
+}
+
+static void start_hal(void)
+{
+	hal_run_step();
+}
+
+/*
+ * hal-late: the HAL is not there when the service starts (the Android side is
+ * still booting), turns up a few probe ticks later, and subscribers are told.
+ */
+static gint late_sent = 0;
+
+static void hal_late_sent(const char *request, const char *reply, gpointer user_data)
+{
+	CHECK(strstr(reply, "\"returnValue\":true") != NULL, "hal-late send: %s", reply);
+	g_atomic_int_inc(&late_sent);
+	shim_disconnect();
+}
+
+static gboolean hal_late_wait(gpointer user_data)
+{
+	char *posts = shim_posts();
+	bool told = strstr(posts, "/getStatus") && strstr(posts, "\"backend\":\"android_ir\"") &&
+	            strstr(posts, "\"available\":true");
+	static int polls = 0;
+
+	g_free(posts);
+
+	if (told)
+	{
+		shim_call("transmit", "{\"frequency\":38000,\"pattern\":[560,560,560]}", hal_late_sent, NULL);
+		return G_SOURCE_REMOVE;
+	}
+
+	if (++polls > 200)
+	{
+		CHECK(false, "hal-late: subscribers never heard the HAL came up");
+		shim_disconnect();
+		return G_SOURCE_REMOVE;
+	}
+
+	return G_SOURCE_CONTINUE;
+}
+
+static gboolean hal_late_appear(gpointer user_data)
+{
+	fake_gbinder_set_present(1);
+	g_timeout_add(10, hal_late_wait, NULL);
+	return G_SOURCE_REMOVE;
+}
+
+static void hal_late_status(const char *request, const char *reply, gpointer user_data)
+{
+	CHECK(strstr(reply, "\"available\":false") != NULL, "hal-late before: %s", reply);
+	/* Several probe ticks (IR_HAL_PROBE_INTERVAL_MS) go by before it shows up */
+	g_timeout_add(5 * IR_HAL_PROBE_INTERVAL_MS, hal_late_appear, NULL);
+}
+
+static void start_hal_late(void)
+{
+	shim_call("getStatus", "{\"subscribe\":true}", hal_late_status, NULL);
+}
+
+/*
  * late-reply: the worker finishes a burst while the main loop is still
  * running - so its reply is queued as an idle source - and the hub goes away
  * before that source is dispatched. The reply must still be sent, once, and
@@ -756,6 +912,8 @@ int main(int argc, char **argv)
 	g_unlink(SEC_IR_SEND);
 	g_unlink(LIRC_DEVICE);
 	write_result("1\n");
+	/* No HAL unless a mode asks for one */
+	fake_gbinder_set_present(0);
 
 	if (strcmp(mode, "lirc") == 0)
 	{
@@ -765,6 +923,15 @@ int main(int argc, char **argv)
 	else if (strcmp(mode, "none") == 0)
 	{
 		shim_set_start(start_none);
+	}
+	else if (strcmp(mode, "hal") == 0)
+	{
+		fake_gbinder_set_present(1);
+		shim_set_start(start_hal);
+	}
+	else if (strcmp(mode, "hal-late") == 0)
+	{
+		shim_set_start(start_hal_late);
 	}
 	else if (strcmp(mode, "late-reply") == 0)
 	{
@@ -794,6 +961,17 @@ int main(int argc, char **argv)
 	}
 	else
 		CHECK(status == 1, "%s: exit status %d after a disconnect, want 1", mode, status);
+
+	if (strcmp(mode, "hal") == 0)
+		CHECK(hal_step == G_N_ELEMENTS(hal_steps), "hal: stopped after step %u", hal_step);
+
+	if (strcmp(mode, "hal-late") == 0)
+		CHECK(g_atomic_int_get(&late_sent) == 1, "hal-late: the send after the HAL came up did not happen");
+
+	/* Whatever the mode, nothing of libgbinder's may be left, nor called at once from two threads */
+	CHECK(fake_gbinder_live() == 0, "%s: %d gbinder objects never released", mode, fake_gbinder_live());
+	CHECK(fake_gbinder_overlaps() == 0, "%s: gbinder entered from two threads at once", mode);
+	shim_free_posts();
 
 	if (strcmp(mode, "late-reply") == 0)
 		CHECK(g_atomic_int_get(&late_replies) == 1, "late-reply: %d replies, want 1", g_atomic_int_get(&late_replies));
